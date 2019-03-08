@@ -1,0 +1,340 @@
+---
+title: "Spatial Interpolation of Calcium concentrations in the Wells"
+author: "Nina Omani"
+date: "March 14, 2018"
+output: word_document
+---
+# **Introduction**
+This document, explains applying different kriging interpolation methods to the Calcium concentration (mg/l) measurements from the wells interpolation within the US. Calcium concentration in form of CaCo3 found in hard water and enter a water supply by leaching from minerals within an aquifer. Rain containing dissolved carbon dioxide can react with calcium carbonate and carry calcium ions away with it. Different kriging methods do not produce dramatically different predictions especially in the areas where monitoring station density is low. The predictions accuracy was not satisfactory but slightly better than the spatially average model. The prediction results might be improved either considering regional interpolation as (regions as dummy variables) or adding explanatory variables (precipitation, elevation, etc.) to the regression models. 
+
+```{r library, echo=FALSE, message=FALSE, warning=FALSE}
+library(fpc)
+library(lme4)
+library(geoR)
+library(fields)
+library(rdist)
+library(kriging)
+library(purrr)
+library(mapview)
+library(webshot)
+library(psych)
+library(cluster)
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(httr)
+library(dataRetrieval)
+library(leaflet)
+library(tidyverse)
+library(stringr)
+library(reshape)
+library(nlme)
+library(mapdata)
+library(lubridate)
+library(reshape2)
+library(magrittr)
+library(scales)
+library(sf)
+library(raster)
+library(gridExtra)
+library(tidyverse)
+library(tmaptools)
+library(tmap)
+library(rgdal)
+library(sp)
+library(gstat)
+library(rgeos)
+library(devtools)
+library(bindrcpp)
+library(mgcv)
+library(lattice)
+library(maptools)
+library(Hmisc)
+library(mapproj)
+library(ggmap)
+```
+# Loading water quality data from WQP 
+Water quality data obtained from [WGP](https://www.waterqualitydata.us/portal/). Start date and end date (YYY-MM-DD) is defined by user.
+Parameters:
+site, list of the sites name and locations
+dat, Water quality dataset 
+
+```{r load_data, results='hide', eval=FALSE}
+yearstart <- seq(ymd("2014-01-01"),ymd("2014-01-01"),by = "years")
+yearend <- seq(ymd("2014-12-31"),ymd("2014-12-31"),by = "years")
+site <- data.frame()
+yearstartf <- format(yearstart,format="%m-%d-%Y")
+yearendf <- format(yearend,format="%m-%d-%Y")
+urlsites <- vector()
+urldata <- vector()
+for (i in 1:length(yearstart)){
+  urlsites[i] <- paste0("https://www.waterqualitydata.us/Station/search?countrycode=US&sampleMedia=Water&sampleMedia=water&characteristicType=Inorganics%2C%20Major%2C%20Metals&characteristicType=Inorganics%2C%20Major%2C%20Non-metals&startDateLo=",yearstartf[i],"&startDateHi=",yearendf[i],"&mimeType=csv&zip=no&sorted=no")
+  urldata[i] <- paste0("https://www.waterqualitydata.us/Result/search?countrycode=US&sampleMedia=Water&sampleMedia=water&characteristicType=Inorganics%2C%20Major%2C%20Metals&characteristicType=Inorganics%2C%20Major%2C%20Non-metals&startDateLo=",yearstartf[i],"&startDateHi=",yearendf[i],"&mimeType=csv&zip=no&sorted=no")
+  site <- read.csv(urlsites[i])
+  site$Year <- year(yearstart[i])
+  dat <- read.csv(urldata[i])
+}
+```
+# Data Cleaning
+The data was explored for missing site name, location, monitoring typ, measured values and unit of measurement. The data obtained from Water Quality Portal (WQP) supports the EPA, USGS and NAWQA database. Data was explored for null measurements, locations and unit of measurements. Median of measurements at each monitoring location then was considered as annual measurement. Total of 3,134 records of data remained from total of 3,355 after eliminating the duplicated locations in the last step of data validation process. The criteria to subset the calcium dataset was as follow:
+* Monitoring Location Type Name : Well
+* Characteristic Name : Calcium 
+* Result Sample Fraction Text : Dissolved
+* Result Measure. Measure Unit Code : mg/l
+* Activity Media Subdivision Name : Groundwater
+
+```{r data_cleaning, results='hide', echo=FALSE}
+site$LongitudeMeasure <- ifelse(site$LongitudeMeasure >0, site$LongitudeMeasure * -1, site$LongitudeMeasure)
+finalsite <- site %>% filter(LongitudeMeasure < -64, LongitudeMeasure > -130, LatitudeMeasure > 25.0, LatitudeMeasure < 50)
+finalsite <- (data.frame(finalsite)) %>%  
+  filter(!(is.na(LatitudeMeasure))) %>% 
+  filter(!(is.na(LongitudeMeasure))) 
+finaldata <- dat %>% 
+  left_join(finalsite, by = c("MonitoringLocationIdentifier" = "MonitoringLocationIdentifier"))
+finaldata <- (data.frame(finaldata)) %>%  
+  filter(!(is.na(LatitudeMeasure))) %>% 
+  filter(!(is.na(LongitudeMeasure))) 
+finaldata$ResultMeasureValue <- as.numeric(finaldata$ResultMeasureValue)
+finaldata <- dat %>% 
+  left_join(finalsite, by = c("MonitoringLocationIdentifier" = "MonitoringLocationIdentifier"))
+finaldata$ResultMeasureValue <- as.numeric(finaldata$ResultMeasureValue)
+finalSubset <- filter(finaldata,ResultMeasureValue != "NA",ResultMeasureValue != "")
+finalSubset$ResultMeasureValue <- as.numeric(finalSubset$ResultMeasureValue)
+finalSubset <- (data.frame(finalSubset))%>%
+  filter(!(is.na(LatitudeMeasure))) %>%
+  filter(ResultMeasure.MeasureUnitCode != "")%>%
+  filter(MonitoringLocationTypeName != "")
+```
+
+```{r leaflet1, echo=FALSE}
+leaflet() %>% addProviderTiles(providers$Esri.NatGeoWorldMap) %>% 
+  addCircles(lng = finalsite$LongitudeMeasure, lat = finalsite$LatitudeMeasure)%>%
+  addLegend("bottomleft",title = "Number of stations", color = "blue",labels = nrow(finalsite))
+```
+
+Because the water quality concentrations have been measured at different days or processed at different time, we considered *median* as an annual average concentration. To find median of the concentrations, the dataset was grouped based on multiple criteria first and the summerised. The resulted table includes count of the measurements at each station `(count)` and median of the counted measurements. 
+
+```{r median, results='hide',echo=FALSE}
+finalSubset1 <- group_by(finalSubset, MonitoringLocationTypeName, ActivityMediaSubdivisionName, CharacteristicName, MonitoringLocationIdentifier, ResultMeasure.MeasureUnitCode, ResultSampleFractionText, LongitudeMeasure, LatitudeMeasure)
+finalsubset3_med <- summarise(finalSubset1, medValues = median(ResultMeasureValue),count = n()) 
+finalsubset3_med <- data.frame(finalsubset3_med)
+```
+```{r WellCalcium_subset, results='hide'}
+finalSubsetWell <- filter(finalsubset3_med,MonitoringLocationTypeName == "Well") %>% group_by(CharacteristicName) %>% mutate(count3=n()) %>% filter(count3 > 100) %>% ungroup()
+dataWell <- filter(finalSubsetWell,finalSubsetWell$CharacteristicName == "Calcium", finalSubsetWell$ResultSampleFractionText == "Dissolved", finalSubsetWell$ResultMeasure.MeasureUnitCode == "mg/l", finalSubsetWell$ActivityMediaSubdivisionName == "Groundwater")
+```
+
+```{r projection,echo=FALSE}
+dataWellPrj <- dataWell
+dataWellPrj$lat <- dataWellPrj$LatitudeMeasure
+dataWellPrj$lon <- dataWellPrj$LongitudeMeasure
+coord <- cbind(dataWellPrj$LongitudeMeasure, dataWellPrj$LatitudeMeasure)
+coord <- SpatialPoints(coord)
+coordinates(dataWellPrj) <- c("LongitudeMeasure","LatitudeMeasure")
+nad83 <- "+init=epsg:4269 +proj=longlat +ellps=GRS80 +datum=NAD83 +no_defs +towgs84=0,0,0"
+mrc <- "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs"
+proj4string(dataWellPrj) = CRS(nad83)
+dataWellPrj <- spTransform(dataWellPrj, CRS(mrc))
+dataWellPrj$X <- dataWellPrj$LongitudeMeasure
+dataWellPrj$Y <- dataWellPrj$LatitudeMeasure
+loc <- cbind(dataWellPrj$X ,dataWellPrj$Y)
+qqnorm(dataWellPrj$medValues, main = "Ca concentration")
+hist(dataWellPrj$medValues, xlab="mg/l", ylab= "Frequency", main = "Ca concentration", nclass= 10)
+```
+
+```{r train_dataset, results='hide',echo=FALSE}
+dataWellPrj <- dataWellPrj[-zerodist(dataWellPrj)[,1],] 
+set.seed(131)
+index <- sample(NROW(dataWellPrj)-1)
+rep2data <- dataWellPrj[index,]
+datasize <- floor(0.9 * NROW(rep2data))
+set.seed(1231)
+train_ind <- sample(seq_len(NROW(rep2data)),size=datasize,replace=F)
+train1 <- rep2data[train_ind,]
+test1 <- rep2data[-train_ind,]
+loc_train1 <- cbind(train1$X,train1$Y)
+loc_test1 <- cbind(test1$X,test1$Y)
+```
+The original data then was projected to Google Mercator or Web Mercator to being compatible with Web mapping applications (e.g. leaflet) with datum NAD83 (EPSG4269). The Web Mercator coordinate system measuring distance unit is meters.
+We ignore the non-normality of the data (Figure 1) and regression residuals since the Central Limit Theorem ensured the sampling distribution of mean will resemble a normal distribution in case of large sample size. Locations of monitoring stations is presented in Figure2.
+An underlying trend should be taken into account if applying Ordinary Kriging (Universal Kriging is supposed to take the drift into account). The quilt plot (package "fields") of calcium concentrations in Figure 3 (left) reveals the possibility of SE-NW surface trend in data. The first order surface trend is presented in Figures 4. F ratio express a significant trend. The square root of standardized residual plot reveals the non-constant variance with predicted calcium concentration, which means the 1st order trend model might not be appropriate choice for detrending the data. After trying the different polynomial orders, we concluded that the potential appropriate model for detrending could be the 5th order function with 11 statistically significant parameters. As Figure 3 (right) shows there is still some trends in the residuals but we stick on the detrended data by 5th order polynomial.
+Bellow figure shows monitoring locations for measuring Calcium concentration.
+
+```{r Wells,echo=FALSE}
+leaflet() %>% addProviderTiles(providers$Esri.NatGeoWorldMap) %>% addCircles(lng = dataWell$LongitudeMeasure, lat = dataWell$LatitudeMeasure)%>%
+  addLegend("bottomleft",title = "Number of stations", color = "blue",labels = nrow(finalsite))
+```
+
+# **Interpolation**
+### Surface trend
+```{r Trend, results='hide', echo=FALSE}
+usualreg1 <- lm(medValues ~ polym(LongitudeMeasure , LatitudeMeasure, degree=1, raw=T), data=dataWellPrj)
+usualreg2 <- lm(medValues ~ polym(LongitudeMeasure , LatitudeMeasure, degree=2, raw=T), data=dataWellPrj)
+usualreg <- lm(medValues ~ polym(LongitudeMeasure , LatitudeMeasure, degree=5, raw=T), data=dataWellPrj)
+
+resids <- as.data.frame(residuals(usualreg))[,1]
+shapiro.test(resids)
+dataWellPrj$First_order <- predict(usualreg1,dataWellPrj)
+dataWellPrj$Second_order <- predict(usualreg2,dataWellPrj)
+dataWellPrj$Fifth_order <- predict(usualreg,dataWellPrj)
+summary(resids)
+summary(dataWellPrj$pred)
+pts <- list('sp.points', dataWellPrj, pch=1, cex=0.7, col='black')
+```
+
+```{r regplots, eval=FALSE}
+hist(residuals(usualreg), nclass=20)
+cuts = c(2.3e+4,3.0e+4,3.5e+4,4.0e+4,4.5e+4,5.1e+4)
+spplot(dataWellPrj, c("First_order", "Second_order", "Fifth_order"), main=c("Surface Trend"), cuts=cuts,
+       key.space = "right", as.table = TRUE)
+```
+```{r quiltplots, eval=FALSE}
+par(mar=c(5,5,5,5))
+quilt.plot(coordinates(dataWellPrj)/1000,dataWellPrj$medValues, main="Ca (mg/l)", xlab="X-km", ylab="Y-km")
+quilt.plot(coordinates(dataWellPrj)/1000,resids, main="Residuals", xlab="X-km", ylab="Y-km")
+
+```
+### Empirical Variogram
+For construction of the Kriging model, must first have a variogram model (Package gorR). First, the sample variogram was calculated and then the model was fit to the sample variogram. Data transformation (Box-Cox) is allowed. "Trends" can be specified and are fitted by ordinary least squares in which case the variograms are computed using the residuals. In case of using Ordinary Kriging interpolation, the trend should be constant or "cte". 
+Because of the irregular distribution of the wells, we cannot expect to find many pairs of data values separated by 1000 m, if we find any at all. Here we have introduced a "nugget tolerance" of 500 m. The nugget is usually assumed to be non-spatial variation due to measurement error and variations in the data that relate to shorter ranges than the minimum sampled data spacing. Here the nugget is estimated to 1.0e+8. The "range" or active lag distance based on the empirical variogram is 17000 m. At this range a plateau or sill in the semivariance values has been reached 2.0e+8. So, it is suggested to pooling the data pairs with separation distances between 500 and 17000 m in order to get a reasonable number of pairs for computing statistics. Based on the empirical variogram the data is stationary or the variance remains unchanged with distance (i.e. the covariance exists and is only dependent on the distance between any two values, and not on the locations). As the variogram shows, the residuals are independent from the distance and does not change in distances further than 17 km. The empirical variogram after and before considering nugget tolerance is presented in Figure 5. 
+The next step is to fit the variogram model to empirical variogram. Various covariance structures were applied (Table 1) and parameters were estimated by least squares ???t of empirical variograms: with options for ordinary (OLS) and weighted (WLS) least squares (using the function variofit). The best fitted model was selected based on the RMSE values. Amongst the fitted models, the model based on the "matern" covariance and OLS estimation method fits best to the empirical variogram. The estimated parameters by OLS then was applied in likelihood based method, restricted maximum likelihood (REML), parameter estimation as initial value of the model parameters (Table 2). Trends can was speci???ed as 1st order function of the coordinates and constant (Intercept).Theoretical and empirical variograms plotted in Figure 6. 
+
+
+```{r variogram, eval=FALSE}
+vario.b <- variog(coords=coordinates(dataWellPrj), data=dataWellPrj$medValues, uvec=15, nugget.tolerance = 500, max.dist=200000)
+vario.s <- variog(coords=coordinates(dataWellPrj), data=dataWellPrj$medValues, max.dist=100000, op="sm", band=20)
+```
+```{r varioplots, eval=FALSE}
+plot(vario.b, main="Calcium")
+plot(vario.s, main="Calcium", ylim=c(0,5e+8))
+```
+
+Estimate covariance parameters by fitting a parametric model to a empirical variogram. Variograms models can be fitted by using weighted or ordinary least squares.
+
+```{r variofit, results='hide', echo=FALSE}
+ols <- variofit(vario.b, cov.model="matern", fix.nugget=FALSE, wei="equal", max.dist=200000)
+wlsspher <- variofit(vario.b, cov.model="spherical", fix.nugget=FALSE, max.dist=200000)
+wlscirc <- variofit(vario.b, cov.model="circular", fix.nugget=FALSE,  max.dist=200000)
+wlscub <- variofit(vario.b, cov.model="cubic", fix.nugget=FALSE, max.dist=200000)
+wlsexp <- variofit(vario.b, cov.model="exponential", fix.nugget=FALSE,max.dist=200000)
+wave1 <- variofit(vario.b, cov.model="wave", fix.nugget=FALSE, max.dist=200000)
+wlsmat2 <- variofit(vario.b, cov.model="matern", fix.nugget=FALSE, fix.kappa=TRUE, kappa=1.5, max.dist=200000)
+```
+
+```{r likfit, results='hide', echo=FALSE, eval=FALSE}
+# This section may take one hour.
+parsall <- data.frame(cbind(ols,wlsspher, wlscirc, wlscub, wlsexp, wave1, wlsmat2))
+RMSE <- parsall[5,c(1:7)] %>% as.data.frame()
+id <- row(RMSE)[apply(RMSE,1,which.max)][1]
+nugget= parsall[1,id]
+ini.pars <-  parsall[,id]$cov.pars[c(1,2)] # variance, range
+# package lme4
+reml1 <- likfit(coords= loc_train1,data=train1$medValues,trend="cte",cov.model="matern", ini.cov.pars= ini.pars, fix.nugget = FALSE, fix.kappa=FALSE, lik.method="REML") 
+reml2 <- likfit(coords= loc_train1,data=train1$medValues,trend="1st",cov.model="matern", ini.cov.pars= ini.pars, fix.nugget = FALSE, fix.kappa=FALSE,lik.method="REML") 
+```
+```{r fig.cap = "figure caption. \\label{figurelabel}"}
+par(mar=c(5.1, 4.1, 4.1, 10.1))
+plot(vario.b, main="Fitted variance models to empirical variogram")
+lines(ols, lty = 1, col="red")
+lines(reml1, lty = 1)
+lines(reml2, lty = 2)
+lines(wlsspher, lty= 2, col="red")
+lines(wlscirc, lty= 3)
+lines(wlscub, lty= 4, col="green")
+lines(wlsexp, lty= 5, col="green")
+lines(wave1, lty= 3, col="red")
+lines(wlsmat2, lty= 6, col="blue")
+legend("topright", inset=c(-0.2,0), legend=c("ols_matern","reml-cte","reml-1st","wls_spher","wls_circ", "wls_cub", "wls_exp", "wls_wave", "wls-mat_1.5"), col=c("red", "black","black", "red", "black", "green", "green","red", "blue"),lty=c(1,1,2,2,3,4,5,3,6), title="variofit", xpd = TRUE)
+```
+
+# **Prediction**
+If the data distribution is irregular, the best interpolation method is kriging. Local, Ordinary, Universal (Trend) Kriging are the most popular Kriging methods for water quality interpolation. The only required assumption to perform Kriging interpolation is spatial stationarity. Universal Kriging can produce good local estimates in the presence of a trend.  In general, Ordinary Kriging is preferred unless we have strong reasons to remove a trend surface. 
+Ordinary and Universal Kriging (krige function in R) applied to train dataset using the parameters estimated by REML (no trend REML used for OK interpolation and 1st order trend REML used for UK interpolation). The RMSE of test dataset prediction for NULL model (average of concentrations) was 15,554. RMSE from UK and OK and Local Kriging (searching radius = 50 km) was 14,752, 14,850 and 14,674. While the RMSE of interpolated test data shows the Kriging prediction is more accurate than the average model R2 is not in acceptable range (R2 = 0.09 for predicted concentrations by UK). Figure 7 shows the interpolated maps. Considering the irregular location of the monitoring points, Local Kriging might be more appropriate choice for prediction.
+
+```{r empty_spoints, results='hide', echo=FALSE} 
+# Creating an empty spatial points data frame with 10 km points distance for interpoation.
+r1 <- raster(dataWellPrj)
+e <- extent(r1)+2000
+r <- raster(e , res=10000) #distance unit: meter
+proj4string(r) = CRS(mrc)
+datawellPrj_raster <- rasterize(coordinates(dataWellPrj), r,dataWellPrj$medValues, fun=median)
+vals<-data.frame(raster::extract(datawellPrj_raster,1:ncell(datawellPrj_raster)))
+coord1<-data.frame(xyFromCell(datawellPrj_raster,1:ncell(datawellPrj_raster)))
+datawellPrj_p <- data.frame(coord1, vals) %>% setNames(c("LongitudeMeasure","LatitudeMeasure", "vals2"))
+coordinates(datawellPrj_p) = ~LongitudeMeasure + LatitudeMeasure
+proj4string(datawellPrj_p) = CRS(mrc)
+```
+```{r Clipping, results='hide', echo=FALSE}
+#download.file("http://www2.census.gov/geo/tiger/GENZ2015/shp/cb_2015_us_state_20m.zip", destfile = "states.zip")
+#unzip("states.zip", exdir = "states")
+us_geo <- read_shape("states/cb_2015_us_state_20m.shp", as.sf = FALSE)
+us_geoPrj <- spTransform(us_geo, CRS(mrc))
+# Clipping
+zones <- us_geoPrj
+datawell_us <- datawellPrj_p[zones, ]
+```
+```{r univ_krig, results='hide', echo=FALSE}
+fit <- reml2
+vgm.fit <- as.vgm.variomodel(fit)
+uk <- krige(medValues ~ polym(LongitudeMeasure , LatitudeMeasure, degree=2, raw=T), train1,test1, model=vgm.fit)   
+regfit <- lm(test1$medValues~uk$var1.pred)
+plot(x=test1$medValues,y=uk$var1.pred, xlim=range(5000:60000), ylim=range(5000:60000))
+  abline(lm(test1$medValues~uk$var1.pred), col="red")
+  legend("topright", bty="n", col="red", legend=paste("R2 =", format(summary(regfit)$adj.r.squared, digits=4)))
+```
+
+```{r loc_ord_krig, results='hide', echo=FALSE}
+fit <- reml1
+vgm.fit1 <- as.vgm.variomodel(fit)
+ok <- krige(medValues ~ 1, train1,test1, model=vgm.fit1)
+lk <- krige(medValues ~ 1, train1,test1, model=vgm.fit1, nmax = Inf, nmin = 0, maxdist = 200000)
+
+regfit <- lm(test1$medValues~lk$var1.pred)
+plot(x=test1$medValues,y=lk$var1.pred, xlim=range(5000:60000), ylim=range(5000:60000))
+abline(lm(test1$medValues~lk$var1.pred), col="red")
+legend("topright", bty="n", col="red", legend=paste("R2 =", format(summary(regfit)$adj.r.squared, digits=4)))
+
+regfit <- lm((test1$medValues)~(ok$var1.pred))
+plot(x=(test1$medValues),y=(ok$var1.pred),xlim=range(5000:60000), ylim=range(5000:60000))
+abline(regfit, col="red",xlim=range(5000:60000), ylim=range(5000:60000))
+legend("topright", bty="n", col="red", legend=paste("R2 =", format(summary(regfit)$adj.r.squared, digits=4)))
+```
+
+```{r rmse, echo=FALSE}
+RMSE <- function(observed, predicted) {
+  sqrt(mean((predicted - observed)^2, na.rm=TRUE))
+}
+null1 <- RMSE(train1$medValues,mean(train1$medValues)); null1
+rmseu <- RMSE(uk$var1.pred, test1$medValues); rmseu
+rmseo <- RMSE(ok$var1.pred, test1$medValues); rmseo
+rmsel <- RMSE(lk$var1.pred, test1$medValues); rmsel
+```
+
+```{r kriging_prediction, echo=FALSE, eval=FALSE}
+uk2 <- krige(medValues ~ polym(LongitudeMeasure, LatitudeMeasure, degree=2, raw=T), dataWellPrj, datawell_us, model=vgm.fit)   
+ok2 <- krige(medValues ~ 1, train1, datawell_us, model=vgm.fit1) 
+lk2 <- krige(medValues ~ 1, train1,datawell_us, model=vgm.fit1, nmax = Inf, nmin = 0, maxdist = 200000)
+```
+
+```{r predictions_plots, echo=FALSE, eval=FALSE}
+ok2 %>% as.data.frame %>%
+  ggplot(aes(x=LongitudeMeasure/1000, y=LatitudeMeasure/1000)) + geom_tile(aes(fill=var1.pred)) + coord_equal() +
+  scale_fill_gradient(low = "green", high="red") +
+  scale_x_continuous(labels=comma) + scale_y_continuous(labels=comma) + ggtitle("Ordinary Kriging") +
+  theme_bw()
+
+uk2 %>% as.data.frame %>%
+  ggplot(aes(x=LongitudeMeasure/1000, y=LatitudeMeasure/1000)) + geom_tile(aes(fill=var1.pred)) + coord_equal() +
+  scale_fill_gradient(low = "green", high="red") +
+  scale_x_continuous(labels=comma) + scale_y_continuous(labels=comma) + ggtitle("Universal Kriging") +
+  theme_bw()
+
+lk2 %>% as.data.frame %>%
+  ggplot(aes(x=LongitudeMeasure/1000, y=LatitudeMeasure/1000)) + geom_tile(aes(fill=var1.pred)) + coord_equal() +
+  scale_fill_gradient(low = "green", high="red") +
+  scale_x_continuous(labels=comma) + scale_y_continuous(labels=comma) + ggtitle("Local Kriging") +
+  theme_bw()
+```
+
+
+
